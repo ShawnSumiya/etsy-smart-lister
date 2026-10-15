@@ -3,6 +3,7 @@ import {
   createSessionToken,
   generateLicenseKey,
   hashLicenseKey,
+  licenseKeyCandidates,
   verifySessionToken,
 } from "./crypto";
 import { getSupabaseLicenseStore } from "./supabase-store";
@@ -151,9 +152,16 @@ export function evaluateLicense(license: LicenseRecord, now = new Date()): Acces
 
 async function findPresentedLicense(licenseKey: string): Promise<LicenseRecord | null> {
   const store = getLicenseStore();
-  const byHash = await store.findByKeyHash(hashLicenseKey(licenseKey));
-  if (byHash) return byHash;
-  return store.findByLegacyKey(licenseKey);
+  const candidates = licenseKeyCandidates(licenseKey);
+  for (const candidate of candidates) {
+    const byHash = await store.findByKeyHash(hashLicenseKey(candidate));
+    if (byHash) return byHash;
+  }
+  for (const candidate of candidates) {
+    const legacy = await store.findByLegacyKey(candidate);
+    if (legacy) return legacy;
+  }
+  return null;
 }
 
 export function consumeLoginAttempt(ip: string, now = new Date()): boolean {

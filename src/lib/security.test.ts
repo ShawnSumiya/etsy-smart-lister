@@ -407,4 +407,130 @@ describe("delivery security", { concurrency: 1 }, () => {
     assert.equal((await login(loginRequest("missing-2"))).status, 401);
     assert.equal((await login(loginRequest("missing-3"))).status, 429);
   });
+
+  test("issues an unambiguous grouped key and accepts loose notation", async () => {
+    const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    const pattern = new RegExp(`^[${alphabet}]{4}(?:-[${alphabet}]{4}){3}$`);
+    const issued = await issueLicense({ buyerId: "format-buyer" });
+    const record = await store.findById(issued.id);
+
+    assert.match(issued.licenseKey, pattern);
+    assert.equal(record?.keyHash, hashLicenseKey(issued.licenseKey));
+    assert.equal(store.containsPlaintext(issued.licenseKey), false);
+
+    const loose = `  ${issued.licenseKey.toLowerCase().replaceAll("-", " ")}  `;
+    const response = await login(loginRequest(loose));
+    assert.equal(response.status, 200);
+  });
+
+  test("still accepts an older 48-character hex key with different notation", async () => {
+    const legacyHex = "01234567-89abcdef-01234567-89abcdef-01234567-89abcdef";
+    const legacy: LicenseRecord = {
+      id: randomUUID(),
+      keyHash: hashLicenseKey(legacyHex),
+      buyerId: "old-hex-buyer",
+      isActive: true,
+      validFrom: new Date(Date.now() - 86_400_000).toISOString(),
+      expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+      revokedAt: null,
+      rateWindowStart: null,
+      rateCount: 0,
+    };
+    await store.insert(legacy);
+
+    const response = await login(
+      loginRequest("01234567 89ABCDEF-01234567-89abcdef 01234567-89ABCDEF")
+    );
+    assert.equal(response.status, 200);
+    assert.equal(store.containsPlaintext(legacyHex), false);
+  });
+
+  test("generates from a keyword when no images are sent", async () => {
+    const { token } = await issueAndLogin(store);
+    const response = await generate(generateRequest(token, { keyword: "シルバーリング" }));
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(generateCalls.length, 1);
+    assert.equal(generateCalls[0].keyword, "シルバーリング");
+    assert.equal(generateCalls[0].imageParts.length, 0);
+    assert.equal(body.tags.length, 13);
+  });
+
+  test("distinguishes Gemini HTTP statuses from session and license errors", async () => {
+    const cases = [
+      { status: 401, http: 502, code: "gemini_unauthorized" },
+      { status: 403, http: 502, code: "gemini_forbidden" },
+      { status: 429, http: 429, code: "gemini_rate_limited" },
+      { status: 400, http: 422, code: "gemini_bad_request" },
+      { status: 500, http: 502, code: "gemini_unavailable" },
+    ];
+    const { token } = await issueAndLogin(store);
+
+    for (const item of cases) {
+      setListingGeneratorForTests(async () => {
+        const error = new Error("upstream failure");
+        Object.assign(error, {
+          status: item.status,
+          statusText: "Bad Request",
+          errorDetails: [{ reason: "API_KEY_INVALID" }],
+        });
+        throw error;
+      });
+      const response = await generate(generateRequest(token, { keyword: "ring" }));
+      const body = await response.json();
+      assert.equal(response.status, item.http);
+      assert.equal(body.code, item.code);
+      assert.equal(JSON.stringify(body).includes("API_KEY"), false);
+      assert.equal(JSON.stringify(body).includes("upstream"), false);
+    }
+  });
+
+  test("logs Gemini status and reason without request secrets", async () => {
+    const secret = "AIzaSecretValueShouldNotBeLogged";
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(" "));
+    };
+    try {
+      const { token } = await issueAndLogin(store);
+      setListingGeneratorForTests(async () => {
+        const error = new Error(`request failed key=${secret}`);
+        Object.assign(error, {
+          status: 400,
+          statusText: "Bad Request",
+          errorDetails: [{ reason: "API_KEY_INVALID" }, { reason: secret }, { message: secret }],
+        });
+        throw error;
+      });
+      const response = await generate(generateRequest(token, { keyword: "ring" }));
+      const body = await response.json();
+      assert.equal(response.status, 422);
+      assert.equal(body.code, "gemini_bad_request");
+      assert.equal(logs.length, 1);
+      assert.match(logs[0], /upstreamStatus=400/);
+      assert.match(logs[0], /upstreamStatusText=Bad Request/);
+      assert.match(logs[0], /reason=API_KEY_INVALID/);
+      assert.equal(logs[0].includes(secret), false);
+      assert.equal(JSON.stringify(body).includes(secret), false);
+    } finally {
+      console.error = original;
+    }
+  });
+
+  test("does not retry an upstream Gemini failure", async () => {
+    let calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      const error = new Error("quota");
+      Object.assign(error, { status: 429, statusText: "Too Many Requests" });
+      throw error;
+    });
+    const { token } = await issueAndLogin(store);
+    const response = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(response.status, 429);
+    assert.equal((await response.json()).code, "gemini_rate_limited");
+    assert.equal(calls, 1);
+  });
 });
