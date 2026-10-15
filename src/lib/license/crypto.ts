@@ -11,13 +11,39 @@ export type SessionPayload = {
   exp: number;
 };
 
+const LICENSE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+const LICENSE_ALPHABET_SPAN = 248;
+
 export function hashLicenseKey(licenseKey: string): string {
   return createHash("sha256").update(licenseKey, "utf8").digest("hex");
 }
 
 export function generateLicenseKey(): string {
-  const hex = randomBytes(24).toString("hex");
-  return hex.match(/.{8}/g)!.join("-");
+  const chars: string[] = [];
+  while (chars.length < 16) {
+    for (const byte of randomBytes(16)) {
+      if (byte >= LICENSE_ALPHABET_SPAN) continue;
+      chars.push(LICENSE_ALPHABET[byte % LICENSE_ALPHABET.length]);
+      if (chars.length === 16) break;
+    }
+  }
+  return [0, 4, 8, 12].map((start) => chars.slice(start, start + 4).join("")).join("-");
+}
+
+export function licenseKeyCandidates(licenseKey: string): string[] {
+  const trimmed = licenseKey.trim();
+  if (!trimmed) return [];
+  const candidates = [trimmed];
+  const compact = trimmed.replace(/[\s-]+/g, "");
+  if (/^[0-9A-Za-z]{16}$/.test(compact)) {
+    const grouped = compact.toUpperCase().match(/.{4}/g)!.join("-");
+    if (grouped !== trimmed) candidates.push(grouped);
+  }
+  if (/^[0-9A-Fa-f]{48}$/.test(compact)) {
+    const grouped = compact.toLowerCase().match(/.{8}/g)!.join("-");
+    if (grouped !== trimmed) candidates.push(grouped);
+  }
+  return candidates;
 }
 
 export function getSessionSecret(): string {

@@ -13,6 +13,114 @@ type RequestBody = {
   keyword?: unknown;
 };
 
+type GenerateFailure = {
+  httpStatus: 422 | 429 | 500 | 502;
+  code: string;
+  message: string;
+  logDetail: string;
+};
+
+function readUpstreamStatus(error: unknown): number | null {
+  if (!error || typeof error !== "object" || !("status" in error)) return null;
+  const status = error.status;
+  return typeof status === "number" && Number.isInteger(status) ? status : null;
+}
+
+function readStatusText(error: unknown): string | null {
+  if (!error || typeof error !== "object" || !("statusText" in error)) return null;
+  const statusText = error.statusText;
+  return typeof statusText === "string" && /^[A-Za-z][A-Za-z ]{0,40}$/.test(statusText) ? statusText : null;
+}
+
+function readSafeReasons(error: unknown): string[] {
+  if (!error || typeof error !== "object" || !("errorDetails" in error)) return [];
+  const details = error.errorDetails;
+  if (!Array.isArray(details)) return [];
+  const reasons: string[] = [];
+  for (const detail of details) {
+    if (!detail || typeof detail !== "object" || !("reason" in detail)) continue;
+    const reason = detail.reason;
+    if (typeof reason === "string" && /^[A-Z0-9_]{1,64}$/.test(reason)) reasons.push(reason);
+  }
+  return reasons;
+}
+
+export function classifyGenerateError(error: unknown): GenerateFailure {
+  const name = error instanceof Error ? error.constructor.name : "unknown";
+  const upstreamStatus = readUpstreamStatus(error);
+  const statusText = readStatusText(error);
+  const reasons = readSafeReasons(error);
+  const logDetail = [
+    `name=${name}`,
+    `upstreamStatus=${upstreamStatus ?? "none"}`,
+    `upstreamStatusText=${statusText ?? "none"}`,
+    `reason=${reasons.length > 0 ? reasons.join(",") : "none"}`,
+  ].join(" ");
+
+  if (error instanceof Error && error.message === "GEMINI_API_KEY is not set") {
+    return {
+      httpStatus: 500,
+      code: "gemini_not_configured",
+      message: "生成サービスが一時的に利用できません。",
+      logDetail,
+    };
+  }
+  if (error instanceof SyntaxError) {
+    return {
+      httpStatus: 422,
+      code: "invalid_output",
+      message: "生成結果の形式が不正です。",
+      logDetail,
+    };
+  }
+  if (upstreamStatus === 401) {
+    return {
+      httpStatus: 502,
+      code: "gemini_unauthorized",
+      message: "生成サービスが一時的に利用できません。",
+      logDetail,
+    };
+  }
+  if (upstreamStatus === 403) {
+    return {
+      httpStatus: 502,
+      code: "gemini_forbidden",
+      message: "生成サービスがこのリクエストを拒否しました。",
+      logDetail,
+    };
+  }
+  if (upstreamStatus === 429) {
+    return {
+      httpStatus: 429,
+      code: "gemini_rate_limited",
+      message: "生成サービスが混み合っています。しばらく待ってから再度お試しください。",
+      logDetail,
+    };
+  }
+  if (upstreamStatus !== null && upstreamStatus >= 400 && upstreamStatus < 500) {
+    return {
+      httpStatus: 422,
+      code: "gemini_bad_request",
+      message: "生成リクエストを処理できませんでした。入力を変えて再度お試しください。",
+      logDetail,
+    };
+  }
+  if (upstreamStatus !== null && upstreamStatus >= 500) {
+    return {
+      httpStatus: 502,
+      code: "gemini_unavailable",
+      message: "生成サービスが一時的に利用できません。",
+      logDetail,
+    };
+  }
+  return {
+    httpStatus: 500,
+    code: "unexpected",
+    message: "予期せぬエラーが発生しました。",
+    logDetail,
+  };
+}
+
 export async function handleGenerate(req: NextRequest): Promise<NextResponse> {
   const access = await requireLicenseToken(req.cookies.get(SESSION_COOKIE)?.value);
   if (!access.ok) {
@@ -60,8 +168,16 @@ export async function handleGenerate(req: NextRequest): Promise<NextResponse> {
     try {
       generated = await getListingGenerator()(generateInput);
     } catch (error) {
-      console.error("Error in /api/generate:", error instanceof Error ? error.name : "unknown");
-      return NextResponse.json({ error: "予期せぬエラーが発生しました。" }, { status: 500 });
+      const failure = classifyGenerateError(error);
+      if (failure.code === "invalid_output" && attempt < MAX_MODEL_ATTEMPTS - 1) {
+        validationError = failure.message;
+        continue;
+      }
+      console.error("Error in /api/generate:", failure.logDetail);
+      return NextResponse.json(
+        { error: failure.message, code: failure.code },
+        { status: failure.httpStatus }
+      );
     }
 
     const normalized = normalizeListing(generated);
