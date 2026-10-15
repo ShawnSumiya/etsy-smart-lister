@@ -14,7 +14,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/use-toast";
-import { supabase } from "@/lib/supabase";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -38,35 +37,25 @@ export default function LoginPage() {
     setIsLoading(true);
 
     try {
-      const nowIso = new Date().toISOString();
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ licenseKey: trimmedKey }),
+      });
+      const payload = (await response.json().catch(() => null)) as {
+        error?: string;
+      } | null;
 
-      const { data, error } = await supabase
-        .from("license_keys")
-        .select("*")
-        .eq("key", trimmedKey)
-        .eq("is_active", true)
-        .gt("expires_at", nowIso)
-        .maybeSingle();
-
-      if (error) {
-        console.error(error);
-        throw new Error("ライセンスキーの確認中にエラーが発生しました。");
-      }
-
-      if (!data) {
+      if (!response.ok) {
         addToast({
           title: "ライセンスキーが無効です",
           description:
+            payload?.error ||
             "キーが存在しないか、無効化されているか、有効期限が切れています。",
           duration: 2000,
         });
         return;
       }
-
-      const maxAgeDays = 7;
-      const maxAgeSeconds = maxAgeDays * 24 * 60 * 60;
-
-      document.cookie = `session_token=valid; path=/; max-age=${maxAgeSeconds}; sameSite=Lax`;
 
       addToast({
         title: "ログインしました",

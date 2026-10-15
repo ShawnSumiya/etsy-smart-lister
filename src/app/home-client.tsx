@@ -2,6 +2,7 @@
 
 import imageCompression from "browser-image-compression";
 import { useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   UploadCloud,
   Image as ImageIcon,
@@ -24,15 +25,18 @@ type GeneratedResult = {
   title: string;
   tags: string[];
   description: string;
-  snsPost: string;
+  xPost: string;
+  instagramPost: string;
 };
 
 export default function HomeClient() {
+  const router = useRouter();
   const { addToast } = useToast();
   const [keyword, setKeyword] = useState("");
   const [images, setImages] = useState<string[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [result, setResult] = useState<GeneratedResult | null>(null);
+  const [generationError, setGenerationError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const handleCopy = (label: string, content: string) => {
@@ -132,7 +136,7 @@ export default function HomeClient() {
     }
 
     setIsGenerating(true);
-    setResult(null);
+    setGenerationError(null);
 
     try {
       const response = await fetch("/api/generate", {
@@ -146,14 +150,33 @@ export default function HomeClient() {
         }),
       });
 
+      if (response.status === 401) {
+        addToast({
+          title: "ログインが必要です",
+          description: "ライセンスキーで再度ログインしてください。",
+          duration: 2000,
+        });
+        router.push("/login");
+        return;
+      }
+
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(errorText || "生成に失敗しました。");
+        let message = "生成に失敗しました。時間をおいてもう一度お試しください。";
+        try {
+          const payload = JSON.parse(errorText) as { error?: string };
+          if (payload.error) message = payload.error;
+        } catch {
+          if (errorText) message = errorText;
+        }
+        setGenerationError(message);
+        return;
       }
 
       const data = (await response.json()) as GeneratedResult;
 
       setResult(data);
+      setGenerationError(null);
       addToast({
         title: "生成が完了しました",
         description: "Etsy 出品データを生成しました。",
@@ -161,17 +184,22 @@ export default function HomeClient() {
       });
     } catch (error) {
       console.error(error);
-      addToast({
-        title: "エラーが発生しました",
-        description:
-          error instanceof Error
+      const message =
+        error instanceof TypeError
+          ? "通信に失敗しました。接続を確認して、もう一度お試しください。"
+          : error instanceof Error && error.message
             ? error.message
-            : "データ生成中に問題が発生しました。",
-        duration: 2000,
-      });
+            : "通信に失敗しました。接続を確認して、もう一度お試しください。";
+      setGenerationError(message);
     } finally {
       setIsGenerating(false);
     }
+  };
+
+  const handleLogout = async () => {
+    await fetch("/api/auth/logout", { method: "POST" });
+    router.push("/login");
+    router.refresh();
   };
 
   return (
@@ -192,10 +220,12 @@ export default function HomeClient() {
             </div>
           </div>
           <Button
+            type="button"
             variant="outline"
             className="border-slate-700/80 bg-slate-900/60 text-xs text-slate-200 hover:bg-slate-800 hover:text-slate-50"
+            onClick={handleLogout}
           >
-            ライセンス情報
+            ログアウト
           </Button>
         </div>
       </header>
@@ -332,7 +362,34 @@ export default function HomeClient() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4 text-xs">
-              {isGenerating ? (
+              {generationError && (
+                <div
+                  role="alert"
+                  className="space-y-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-amber-50"
+                >
+                  <div>
+                    <p className="text-xs font-semibold">生成できませんでした</p>
+                    <p className="mt-1 text-[11px] leading-relaxed text-amber-100">
+                      {generationError}
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-8 border-amber-400/50 bg-slate-950/40 text-[11px] text-amber-50 hover:bg-amber-500/20"
+                    onClick={handleGenerate}
+                    disabled={isGenerating}
+                  >
+                    {isGenerating ? "生成中..." : "もう一度生成する"}
+                  </Button>
+                </div>
+              )}
+              {isGenerating && result && (
+                <p className="text-[11px] text-slate-400">
+                  再生成しています。完了または失敗しても、前回の結果は残します。
+                </p>
+              )}
+              {isGenerating && !result ? (
                 <div className="space-y-3">
                   <Skeleton className="h-6 w-2/3 bg-slate-800" />
                   <Skeleton className="h-4 w-full bg-slate-800" />
@@ -343,13 +400,13 @@ export default function HomeClient() {
                 <>
                   <OutputBlock
                     label="Title"
-                    helper="Etsy の SEO を意識した 140 文字以内の英語タイトル"
+                    helper={`Etsy の SEO を意識した英語タイトル（${Array.from(result.title).length}/140文字）`}
                     content={result.title}
                     onCopy={() => handleCopy("Title", result.title)}
                   />
                   <OutputBlock
                     label="SEO Tags"
-                    helper="英語カンマ区切り、最大 13 個"
+                    helper={`英語タグ ${result.tags.length}個、各20文字以内`}
                     content={result.tags.join(", ")}
                     onCopy={() =>
                       handleCopy("SEO Tags", result.tags.join(", "))
@@ -364,17 +421,25 @@ export default function HomeClient() {
                     }
                   />
                   <OutputBlock
-                    label="SNS Post"
-                    helper="Instagram / Pinterest 向け英語プロモーション文（ハッシュタグ付き）"
-                    content={result.snsPost}
-                    onCopy={() => handleCopy("SNS Post", result.snsPost)}
+                    label="X Post"
+                    helper="X（旧Twitter）向け英語プロモーション文"
+                    content={result.xPost}
+                    onCopy={() => handleCopy("X Post", result.xPost)}
+                  />
+                  <OutputBlock
+                    label="Instagram Post"
+                    helper="Instagram向け英語プロモーション文（ハッシュタグ付き）"
+                    content={result.instagramPost}
+                    onCopy={() =>
+                      handleCopy("Instagram Post", result.instagramPost)
+                    }
                   />
                 </>
-              ) : (
+              ) : !generationError ? (
                 <p className="text-[11px] text-slate-500">
                   左側で画像または商品の特徴を入力し、「Etsy 出品データを一括生成」をクリックすると、ここに結果が表示されます。
                 </p>
-              )}
+              ) : null}
             </CardContent>
           </Card>
         </section>
