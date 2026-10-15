@@ -4,9 +4,24 @@ import { consumeGenerationRate, requireLicenseToken } from "../license/guard";
 import { getListingGenerator, toGenerateInput } from "../listing/generator";
 import { MAX_IMAGES, normalizeListing } from "../listing/schema";
 
-// One buyer action consumes one rate-limit slot.
-// If the model output is incomplete, Gemini may be called once more inside that same slot.
+// One buyer action consumes one rate-limit slot and may call Gemini at most twice.
+// The second call is shared by invalid JSON/SEO output and one transient Gemini failure.
 const MAX_MODEL_ATTEMPTS = 2;
+// Stay well under Vercel's function limit. A generation itself can take tens of seconds,
+// so the pause before a retry must stay short enough that two calls can still finish.
+const MAX_TRANSIENT_WAIT_MS = 1000;
+const TRANSIENT_BACKOFF_MS = 250;
+const RETRYABLE_UPSTREAM_STATUS = new Set([500, 503, 504]);
+const TRANSIENT_NETWORK_ERRORS = new Set([
+  "GoogleGenerativeAIError",
+  "GoogleGenerativeAIAbortError",
+  "TypeError",
+]);
+const LONG_LIVED_QUOTA_REASONS = new Set([
+  "RESOURCE_EXHAUSTED",
+  "QUOTA_EXCEEDED",
+  "DAILY_QUOTA_EXCEEDED",
+]);
 
 type RequestBody = {
   images?: unknown;
@@ -121,6 +136,68 @@ export function classifyGenerateError(error: unknown): GenerateFailure {
   };
 }
 
+function parseDelayMs(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.round(value * 1000);
+  }
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) return Math.round(Number(trimmed) * 1000);
+  const duration = /^(\d+(?:\.\d+)?)s$/.exec(trimmed);
+  if (duration) return Math.round(Number(duration[1]) * 1000);
+  if (!/^(?:\w{3}, )?\d{1,2} \w{3} \d{4} /.test(trimmed)) return null;
+  const date = Date.parse(trimmed);
+  if (Number.isNaN(date)) return null;
+  return Math.max(0, date - Date.now());
+}
+
+function readHeader(error: object, name: string): unknown {
+  if (!("headers" in error)) return null;
+  const headers = error.headers;
+  if (!headers || typeof headers !== "object") return null;
+  if ("get" in headers && typeof headers.get === "function") {
+    return headers.get(name);
+  }
+  const record = headers as Record<string, unknown>;
+  return record[name] ?? record[name.toLowerCase()] ?? null;
+}
+
+function readRetryAfterMs(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null;
+  const direct = parseDelayMs("retryAfter" in error ? error.retryAfter : null);
+  if (direct !== null) return direct;
+  const header = parseDelayMs(readHeader(error, "retry-after"));
+  if (header !== null) return header;
+  if (!("errorDetails" in error) || !Array.isArray(error.errorDetails)) return null;
+  for (const detail of error.errorDetails) {
+    if (!detail || typeof detail !== "object" || !("retryDelay" in detail)) continue;
+    const delay = parseDelayMs(detail.retryDelay);
+    if (delay !== null) return delay;
+  }
+  return null;
+}
+
+function transientRetryDelayMs(error: unknown, failure: GenerateFailure): number | null {
+  if (failure.code === "gemini_not_configured" || failure.code === "invalid_output") return null;
+  const upstreamStatus = readUpstreamStatus(error);
+  if (upstreamStatus === 429) {
+    if (readSafeReasons(error).some((reason) => LONG_LIVED_QUOTA_REASONS.has(reason))) return null;
+    const delay = readRetryAfterMs(error);
+    if (delay === null || delay > MAX_TRANSIENT_WAIT_MS) return null;
+    return delay;
+  }
+  if (upstreamStatus !== null) {
+    return RETRYABLE_UPSTREAM_STATUS.has(upstreamStatus) ? TRANSIENT_BACKOFF_MS : null;
+  }
+  const name = error instanceof Error ? error.constructor.name : "";
+  return TRANSIENT_NETWORK_ERRORS.has(name) ? TRANSIENT_BACKOFF_MS : null;
+}
+
+function waitForRetry(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function handleGenerate(req: NextRequest): Promise<NextResponse> {
   const access = await requireLicenseToken(req.cookies.get(SESSION_COOKIE)?.value);
   if (!access.ok) {
@@ -169,11 +246,17 @@ export async function handleGenerate(req: NextRequest): Promise<NextResponse> {
       generated = await getListingGenerator()(generateInput);
     } catch (error) {
       const failure = classifyGenerateError(error);
-      if (failure.code === "invalid_output" && attempt < MAX_MODEL_ATTEMPTS - 1) {
+      const canRetry = attempt < MAX_MODEL_ATTEMPTS - 1;
+      if (canRetry && failure.code === "invalid_output") {
         validationError = failure.message;
         continue;
       }
-      console.error("Error in /api/generate:", failure.logDetail);
+      const delay = canRetry ? transientRetryDelayMs(error, failure) : null;
+      if (delay !== null) {
+        await waitForRetry(delay);
+        continue;
+      }
+      console.error("Error in /api/generate:", `${failure.logDetail} attempts=${attempt + 1}`);
       return NextResponse.json(
         { error: failure.message, code: failure.code },
         { status: failure.httpStatus }
