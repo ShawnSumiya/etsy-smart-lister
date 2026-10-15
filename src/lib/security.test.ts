@@ -14,7 +14,7 @@ import {
   setRateLimitConfigForTests,
 } from "./license/guard";
 import { MemoryLicenseStore, type LicenseRecord } from "./license/store";
-import { setListingGeneratorForTests, type GenerateInput } from "./listing/generator";
+import { embedRetryAfter, setListingGeneratorForTests, type GenerateInput } from "./listing/generator";
 import { SYSTEM_INSTRUCTION, normalizeListing } from "./listing/schema";
 
 const SECRET = "test-session-secret-at-least-32-characters";
@@ -519,7 +519,7 @@ describe("delivery security", { concurrency: 1 }, () => {
     }
   });
 
-  test("does not retry an upstream Gemini failure", async () => {
+  test("does not retry a 429 when recovery time is unknown", async () => {
     let calls = 0;
     setListingGeneratorForTests(async () => {
       calls += 1;
@@ -532,5 +532,217 @@ describe("delivery security", { concurrency: 1 }, () => {
     assert.equal(response.status, 429);
     assert.equal((await response.json()).code, "gemini_rate_limited");
     assert.equal(calls, 1);
+  });
+
+  test("retries a transient Gemini failure once and keeps a single rate-limit slot", async () => {
+    let calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error("unavailable");
+        Object.assign(error, { status: 503, statusText: "Service Unavailable" });
+        throw error;
+      }
+      return sampleListing();
+    });
+    const { token } = await issueAndLogin(store);
+    setRateLimitConfigForTests({ max: 1, windowSeconds: 3600 });
+
+    const response = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(response.status, 200);
+    assert.equal(calls, 2);
+
+    const limited = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(limited.status, 429);
+    assert.equal((await limited.json()).code, "rate_limited");
+    assert.equal(calls, 2);
+  });
+
+  test("returns the Gemini error after a transient retry also fails and still counts the action", async () => {
+    let calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      const error = new Error("unavailable");
+      Object.assign(error, { status: calls === 1 ? 500 : 504, statusText: "Server Error" });
+      throw error;
+    });
+    const { issued, token } = await issueAndLogin(store);
+    setRateLimitConfigForTests({ max: 1, windowSeconds: 3600 });
+
+    const response = await generate(generateRequest(token, { keyword: "ring" }));
+    const body = await response.json();
+    assert.equal(response.status, 502);
+    assert.equal(body.code, "gemini_unavailable");
+    assert.match(body.error, /一時的に利用できません/);
+    assert.equal(calls, 2);
+    assert.equal((await store.findById(issued.id))?.rateCount, 1);
+
+    const limited = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(limited.status, 429);
+    assert.equal(calls, 2);
+  });
+
+  test("retries a fetch failure once inside the same two-call budget", async () => {
+    let calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError("fetch failed");
+      return sampleListing();
+    });
+    const { token } = await issueAndLogin(store);
+
+    const response = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(response.status, 200);
+    assert.equal(calls, 2);
+  });
+
+  test("does not retry a 429 that asks for a long wait", async () => {
+    let calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      const error = new Error("slow down");
+      Object.assign(error, {
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: { "retry-after": "120" },
+        errorDetails: [{ reason: "RATE_LIMIT_EXCEEDED", retryDelay: "120s" }],
+      });
+      throw error;
+    });
+    const { token } = await issueAndLogin(store);
+    const response = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(response.status, 429);
+    assert.equal((await response.json()).code, "gemini_rate_limited");
+    assert.equal(calls, 1);
+  });
+
+  test("retries a 429 only when the stated recovery is within one second", async () => {
+    let calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error("slow down");
+        Object.assign(error, {
+          status: 429,
+          statusText: "Too Many Requests",
+          retryAfter: 0,
+          errorDetails: [{ reason: "RATE_LIMIT_EXCEEDED", retryDelay: "0s" }],
+        });
+        throw error;
+      }
+      return sampleListing();
+    });
+    const { token } = await issueAndLogin(store);
+    const response = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(response.status, 200);
+    assert.equal(calls, 2);
+  });
+
+  test("does not retry a long-lived quota error even when the delay is short", async () => {
+    let calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      const error = new Error("quota");
+      Object.assign(error, {
+        status: 429,
+        statusText: "Too Many Requests",
+        retryAfter: 0,
+        errorDetails: [{ reason: "RESOURCE_EXHAUSTED", retryDelay: "0s" }],
+      });
+      throw error;
+    });
+    const { token } = await issueAndLogin(store);
+    const response = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(response.status, 429);
+    assert.equal(calls, 1);
+  });
+
+  test("does not retry Gemini statuses that will not recover by themselves", async () => {
+    const statuses = [400, 401, 403, 502];
+    const { token } = await issueAndLogin(store);
+    let calls = 0;
+    for (const status of statuses) {
+      const before = calls;
+      setListingGeneratorForTests(async () => {
+        calls += 1;
+        const error = new Error("rejected");
+        Object.assign(error, { status, statusText: "Error" });
+        throw error;
+      });
+      const response = await generate(generateRequest(token, { keyword: "ring" }));
+      assert.notEqual(response.status, 200);
+      assert.equal(calls, before + 1);
+    }
+  });
+
+  test("does not call Gemini or consume a rate slot when authentication fails", async () => {
+    const { issued } = await issueAndLogin(store);
+    const response = await generate(generateRequest(undefined, { keyword: "ring" }));
+    assert.equal(response.status, 401);
+    assert.equal(generateCalls.length, 0);
+    assert.equal((await store.findById(issued.id))?.rateCount, 0);
+  });
+
+  test("copies a Retry-After header into the Gemini error body without calling Gemini", async () => {
+    const response = new Response(
+      JSON.stringify({
+        error: { code: 429, message: "slow", details: [{ reason: "RATE_LIMIT_EXCEEDED" }] },
+      }),
+      {
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: { "content-type": "application/json", "retry-after": "1" },
+      }
+    );
+    const rewritten = await embedRetryAfter(response);
+    const body = (await rewritten.json()) as { error: { details: Array<{ retryDelay?: string }> } };
+    assert.equal(body.error.details.at(-1)?.retryDelay, "1");
+
+    const existing = new Response(
+      JSON.stringify({ error: { details: [{ retryDelay: "0.5s" }] } }),
+      { status: 429, headers: { "content-type": "application/json", "retry-after": "30" } }
+    );
+    const kept = await embedRetryAfter(existing);
+    const keptBody = (await kept.json()) as { error: { details: Array<{ retryDelay?: string }> } };
+    assert.equal(keptBody.error.details.length, 1);
+    assert.equal(keptBody.error.details[0]?.retryDelay, "0.5s");
+
+    const unsafe = new Response(JSON.stringify({ error: { details: [] } }), {
+      status: 429,
+      headers: { "content-type": "application/json", "retry-after": "not a delay" },
+    });
+    const unchanged = await embedRetryAfter(unsafe);
+    const unsafeBody = (await unchanged.json()) as { error: { details: unknown[] } };
+    assert.equal(unsafeBody.error.details.length, 0);
+  });
+
+  test("shares the two-call budget between validation and a transient failure", async () => {
+    let calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      if (calls === 1) return { ...sampleListing(), tags: ["only one"] };
+      const error = new Error("unavailable");
+      Object.assign(error, { status: 503, statusText: "Service Unavailable" });
+      throw error;
+    });
+    const { token } = await issueAndLogin(store);
+    const response = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).code, "gemini_unavailable");
+    assert.equal(calls, 2);
+
+    calls = 0;
+    setListingGeneratorForTests(async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error("unavailable");
+        Object.assign(error, { status: 500, statusText: "Internal Server Error" });
+        throw error;
+      }
+      return { ...sampleListing(), tags: ["only one"] };
+    });
+    const second = await generate(generateRequest(token, { keyword: "ring" }));
+    assert.equal(second.status, 422);
+    assert.equal(calls, 2);
   });
 });
